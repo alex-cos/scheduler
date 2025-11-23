@@ -45,8 +45,9 @@ func main() {
 
     for {
       select {
-      case <-s.C():
+      case t := <-s.C():
         fmt.Println("Tick:", t)
+        // Put a job here that could take time.
         s.Reset()
       }
     }

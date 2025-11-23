@@ -1,12 +1,18 @@
 package scheduler
 
 import (
+	"sync"
 	"time"
 )
 
 type Scheduler struct {
-	ticker   *time.Ticker
 	schedule Schedule
+
+	ch chan time.Time
+
+	mu    sync.Mutex
+	timer *time.Timer
+	stop  chan struct{}
 }
 
 // -----------------------------------------------------------------------------
@@ -15,24 +21,43 @@ type Scheduler struct {
 
 func NewScheduler(s Schedule) *Scheduler {
 	scheduler := &Scheduler{
-		ticker:   nil,
 		schedule: s,
+		ch:       make(chan time.Time, 1),
+		mu:       sync.Mutex{},
+		timer:    nil,
+		stop:     make(chan struct{}),
 	}
-	scheduler.ticker = time.NewTicker(scheduler.computeNextTime())
+
+	go scheduler.run()
 
 	return scheduler
 }
 
 func (s *Scheduler) C() <-chan time.Time {
-	return s.ticker.C
+	return s.ch
 }
 
 func (s *Scheduler) Stop() {
-	s.ticker.Stop()
+	close(s.stop)
 }
 
 func (s *Scheduler) Reset() {
-	s.ticker.Reset(s.computeNextTime())
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.timer == nil {
+		return
+	}
+
+	delay := s.computeDelay()
+
+	if !s.timer.Stop() {
+		select {
+		case <-s.timer.C:
+		default:
+		}
+	}
+	s.timer.Reset(delay)
 }
 
 func (s *Scheduler) GetNextTime() time.Time {
@@ -43,8 +68,50 @@ func (s *Scheduler) GetNextTime() time.Time {
 // Unexported functions
 // ----------------------------------------------------------------------------
 
-func (s *Scheduler) computeNextTime() time.Duration {
+func (s *Scheduler) computeDelay() time.Duration {
 	next := s.schedule.Next(time.Now())
+	delay := time.Until(next)
+	if delay < 0 {
+		delay = 0
+	}
+	return delay
+}
 
-	return time.Until(next)
+func (s *Scheduler) run() {
+	delay := s.computeDelay()
+
+	s.mu.Lock()
+	s.timer = time.NewTimer(delay)
+	s.mu.Unlock()
+
+	for {
+		select {
+		case t := <-s.timer.C:
+			select {
+			case s.ch <- t:
+			default: // drop if slow consumer
+			}
+
+			delay := s.computeDelay()
+
+			s.mu.Lock()
+			if !s.timer.Stop() {
+				select {
+				case <-s.timer.C:
+				default:
+				}
+			}
+			s.timer.Reset(delay)
+			s.mu.Unlock()
+
+		case <-s.stop:
+			s.mu.Lock()
+			if s.timer != nil {
+				s.timer.Stop()
+			}
+			close(s.ch)
+			s.mu.Unlock()
+			return
+		}
+	}
 }
